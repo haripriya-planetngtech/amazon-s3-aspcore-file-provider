@@ -16,16 +16,15 @@ using Syncfusion.DocIO.DLS;
 using Syncfusion.EJ2.DocumentEditor;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
+using System.Threading;
 
 namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
 {
     public class AmazonS3FileProvider
     {
-        protected static string bucketName;
+        private static string bucketName;
         static IAmazonS3 client;
-        static ListObjectsResponse response;
-        static ListObjectsResponse childResponse;
-        public string RootName;
+        private string RootName;
         private string rootName = string.Empty;
         private string accessMessage = string.Empty;
         AccessDetails AccessDetails = new AccessDetails();
@@ -40,6 +39,18 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
         public AmazonS3FileProvider(IHostEnvironment env)
         {
             _env = env;
+        }
+        private static readonly AsyncLocal<ListObjectsResponse> ResponseSlot = new AsyncLocal<ListObjectsResponse>();
+        private static readonly AsyncLocal<ListObjectsResponse> ChildResponseSlot = new AsyncLocal<ListObjectsResponse>();
+        private static ListObjectsResponse response
+        {
+            get => ResponseSlot.Value;
+            set => ResponseSlot.Value = value;
+        }
+        private static ListObjectsResponse childResponse
+        {
+            get => ChildResponseSlot.Value;
+            set => ChildResponseSlot.Value = value;
         }
 
         // Register the amazon client details
@@ -114,6 +125,37 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             this.AccessDetails = details;
             DirectoryInfo root = new DirectoryInfo(RootName);
             this.rootName = root.ToString();
+        }
+
+        private string SanitizePath(string path, string name = null, bool isDirectory = false)
+        {
+            string rootPrefix = (RootName ?? string.Empty).Replace("/", "");
+            string normalizedPath = (path ?? string.Empty).Replace('\\', '/').Trim();
+            string normalizedName = (name ?? string.Empty).Replace('\\', '/').Trim('/');
+            string prev;
+            do { prev = normalizedPath; normalizedPath = Uri.UnescapeDataString(prev); } while (prev != normalizedPath);
+            do { prev = normalizedName; normalizedName = Uri.UnescapeDataString(prev); } while (prev != normalizedName);
+            if (!normalizedPath.StartsWith("/")) normalizedPath = "/" + normalizedPath;
+            while (normalizedPath.Contains("//")) normalizedPath = normalizedPath.Replace("//", "/");
+
+            if (normalizedPath.Contains("..") || normalizedName.Contains(".."))
+                throw new InvalidOperationException("Invalid path segment.");
+
+            if (!string.IsNullOrEmpty(normalizedName) && !normalizedPath.EndsWith("/"))
+                normalizedPath += "/";
+
+            string key = rootPrefix + normalizedPath + normalizedName;
+
+            if (isDirectory)
+            {
+                if (!key.EndsWith("/")) key += "/";
+            }
+            else
+            {
+                if (key.EndsWith("/")) key = key.TrimEnd('/');
+            }
+
+            return key;
         }
 
         // Reads the file(s) and folder(s)
@@ -249,7 +291,8 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             catch (Exception ex) { throw ex; }
 
             if (filesS3.Count != 0) files = files.Union(filesS3).ToList();
-
+//incoming code commented
+            cwd.Permission = GetPathPermission(path, cwd.IsFile);
             readResponse.CWD = cwd;
 
             try
@@ -347,7 +390,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             {
                 List<FileManagerDirectoryContent> files = new List<FileManagerDirectoryContent>();
                 GetBucketList();
-                if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+                if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", SanitizePath(path, null, true), false).Wait();
                 foreach (string name in names)
                 {
                     foreach (FileManagerDirectoryContent item in data) {
@@ -362,7 +405,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     {
                         foreach (string commonPrefix in response.CommonPrefixes)
                         {
-                            if (commonPrefix == this.RootName.Replace("/", "") + path + name)
+                            if (commonPrefix == SanitizePath(path, name, true))
                                 files.Add(CreateDirectoryContentInstance(commonPrefix.Split("/")[commonPrefix.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, false, ""));
                         }
                     }
@@ -370,7 +413,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     {
                         foreach (S3Object S3Object in response.S3Objects)
                         {
-                            if (S3Object.Key == this.RootName.Replace("/", "") + path + name)
+                            if (S3Object.Key == SanitizePath(path, name, false))
                                 files.Add(CreateDirectoryContentInstance(S3Object.Key.Split("/").Last(), true, Path.GetExtension(S3Object.Key), S3Object.Size, S3Object.LastModified, S3Object.LastModified, false, ""));
                         }
                     }
@@ -392,17 +435,17 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
         // Copy the file(s) or folder(s) from a source directory and pastes in given target directory
         public FileManagerResponse Copy(string path, string targetPath, string[] names, string[] replacedItemNames, FileManagerDirectoryContent TargetData, params FileManagerDirectoryContent[] data)
         {
-            return this.TransferItems(path, targetPath, names, replacedItemNames, false, TargetData, data);
+            return TransferItems(path, targetPath, names, replacedItemNames, false, TargetData, data).Result;
         }
 
         // Cut the file(s) or folder(s) from a source directory and pastes in given target directory
         public FileManagerResponse Move(string path, string targetPath, string[] names, string[] replacedItemNames, FileManagerDirectoryContent TargetData, params FileManagerDirectoryContent[] data)
         {
-            return this.TransferItems(path, targetPath, names, replacedItemNames, true, TargetData, data);
+            return TransferItems(path, targetPath, names, replacedItemNames, true, TargetData, data).Result;
         }
 
         // Cut or Copy the file(s) or folder(s) from a source directory and pastes in given target directory
-        public FileManagerResponse TransferItems(string path, string targetPath, string[] names, string[] replacedItemNames, bool isCutRequest, FileManagerDirectoryContent TargetData, params FileManagerDirectoryContent[] data)
+        public virtual async Task<FileManagerResponse> TransferItems(string path, string targetPath, string[] names, string[] replacedItemNames, bool isCutRequest, FileManagerDirectoryContent TargetData, params FileManagerDirectoryContent[] data)
         {
             FileManagerResponse moveResponse = new FileManagerResponse();
             FileManagerDirectoryContent cwd = new FileManagerDirectoryContent();
@@ -429,7 +472,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     }
                 }
                 FileManagerResponse readResponse = new FileManagerResponse();
-                if (targetPath == "/") ListingObjectsAsync("/", RootName, false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + targetPath, false).Wait();
+                if (targetPath == "/") ListingObjectsAsync("/", RootName, false).Wait(); else ListingObjectsAsync("/", SanitizePath(targetPath, null, true), false).Wait();
                 if (targetPath == "/")
                     cwd = response.S3Objects.Where(x => x.Key == RootName).Select(y => CreateDirectoryContentInstance(y.Key.ToString().Replace("/", ""), true, "folder", y.Size, y.LastModified, y.LastModified, false, "")).ToArray()[0];
                 else if (response.CommonPrefixes.Count > 0)
@@ -442,12 +485,12 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         path = "/" + name.Substring(0, name.Length - name.Split("/")[name.Split("/").Length - (name.EndsWith("/") ? 0 : 1)].Length);
                         string n = "";
                         n = name.EndsWith("/") ? name.Split("/")[name.Split("/").Length - 2] : name.Split("/").Last();
-                        if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+                        if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", SanitizePath(path, null, true), false).Wait();
                         if (response.CommonPrefixes.Count > 0)
                         {
                             foreach (string commonPrefix in response.CommonPrefixes)
                             {
-                                if (commonPrefix == this.RootName + name + "/")
+                                if (commonPrefix == SanitizePath("/" + name, null, true))
                                 {
                                     bool hasChild = data[response.CommonPrefixes.IndexOf(commonPrefix)].HasChild;
                                     files.Add(CreateDirectoryContentInstance(commonPrefix, false, "Folder", 0, DateTime.Now, DateTime.Now, hasChild, (TargetData.FilterPath + TargetData.Name + "/")));
@@ -458,7 +501,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         {
                             foreach (S3Object S3Object in response.S3Objects)
                             {
-                                if (S3Object.Key == this.RootName.Replace("/", "") + path + n)
+                                if (S3Object.Key == SanitizePath(path, n, false))
                                     files.Add(CreateDirectoryContentInstance(S3Object.Key, true, Path.GetExtension(S3Object.Key), S3Object.Size, S3Object.LastModified, S3Object.LastModified, false, (TargetData.FilterPath + TargetData.Name + "/")));
                             }
                         }
@@ -466,14 +509,14 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 }
                 else
                 {
-                    if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+                    if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", SanitizePath(path, null, true), false).Wait();
                     if (response.CommonPrefixes.Count > 0)
                     {
                         foreach (string commonPrefix in response.CommonPrefixes)
                         {
                             foreach (string n in names)
                             {
-                                if (commonPrefix == this.RootName.Replace("/", "") + path + n + "/")
+                                if (commonPrefix == SanitizePath(path, n, true))
                                 {
                                     bool hasChild = data[Array.IndexOf(names, n)].HasChild;
                                     files.Add(CreateDirectoryContentInstance(commonPrefix.Split("/")[commonPrefix.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, hasChild, (TargetData.FilterPath + TargetData.Name + "/")));
@@ -487,7 +530,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         {
                             foreach (string n in names)
                             {
-                                if (S3Object.Key == this.RootName.Replace("/", "") + path + n)
+                                if (S3Object.Key == SanitizePath(path, n, false))
                                 {
                                     files.Add(CreateDirectoryContentInstance(S3Object.Key.Split("/").Last(), true, Path.GetExtension(S3Object.Key), S3Object.Size, S3Object.LastModified, S3Object.LastModified, false, (TargetData.FilterPath + TargetData.Name + "/")));
                                 }
@@ -546,13 +589,13 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         while (this.checkFileExist(targetPath, fileName + (directoryCount > 0 ? "(" + directoryCount.ToString() + ")" : "") + Path.GetExtension(x.name))) { directoryCount++; }
                         nameValue = fileName + (directoryCount > 0 ? "(" + directoryCount.ToString() + ")" : "") + Path.GetExtension(x.name);
                     }
-                    if (existFiles.Count == 0) { MoveDirectoryAsync((RootName + checkRoot + "/"), (RootName.Replace("/", "") + targetPath + nameValue + "/"), Path.GetExtension(x.name) != "Folder", isCutRequest); }
+                    if (existFiles.Count == 0) { await MoveDirectoryAsync(SanitizePath("/" + checkRoot, null, true), SanitizePath(targetPath, nameValue, true), Path.GetExtension(x.name) != "Folder", isCutRequest); }
                     else if (replacedItemNames.Length != 0)
                     {
                         foreach (string exFile in existFiles)
                         {
                             if (x.name != exFile || replacedItemNames.Length > 0)
-                                MoveDirectoryAsync((RootName + checkRoot + "/"), (RootName.Replace("/", "") + targetPath + nameValue + "/"), Path.GetExtension(x.name) != "Folder", isCutRequest);
+                                await MoveDirectoryAsync(SanitizePath("/" + checkRoot, null, true), SanitizePath(targetPath, nameValue, true), Path.GetExtension(x.name) != "Folder", isCutRequest);
                         }
                     }
                     else
@@ -560,7 +603,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         foreach (FileManagerDirectoryContent otherFile in otherFiles)
                         {
                             if (existFiles.Where(p => p == x.name).Select(p => p).ToArray().Length < 1)
-                                MoveDirectoryAsync((RootName + checkRoot + "/"), (RootName.Replace("/", "") + targetPath + nameValue + "/"), Path.GetExtension(x.name) != "Folder", isCutRequest);
+                                await MoveDirectoryAsync(SanitizePath("/" + checkRoot, null, true), SanitizePath(targetPath, nameValue, true), Path.GetExtension(x.name) != "Folder", isCutRequest);
                         }
                     }
                 }
@@ -584,13 +627,13 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         nameValue = fileName + (directoryCount > 0 ? "(" + directoryCount.ToString() + ")" : "") + data[x.index].Type;
                     }
                     if (existFiles.Count == 0)
-                        MoveDirectoryAsync((RootName.Replace("/", "") + path + x.name + "/"), (RootName.Replace("/", "") + targetPath + nameValue + "/"), data[x.index].IsFile, isCutRequest);
+                        await MoveDirectoryAsync(SanitizePath(path, x.name, true), SanitizePath(targetPath, nameValue, true), data[x.index].IsFile, isCutRequest);
                     else if (replacedItemNames.Length != 0)
                     {
                         foreach (string existFile in existFiles)
                         {
                             if (x.name != existFile || replacedItemNames.Length > 0)
-                                MoveDirectoryAsync((RootName.Replace("/", "") + path + x.name + "/"), (RootName.Replace("/", "") + targetPath + nameValue + "/"), data[x.index].IsFile, isCutRequest);
+                                await MoveDirectoryAsync(SanitizePath(path, x.name, true), SanitizePath(targetPath, nameValue, true), data[x.index].IsFile, isCutRequest);
                         }
                     }
                     else
@@ -598,7 +641,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         foreach (FileManagerDirectoryContent otherFile in otherFiles)
                         {
                             if (existFiles.Where(p => p == x.name).Select(p => p).ToArray().Length < 1)
-                                MoveDirectoryAsync((RootName.Replace("/", "") + path + x.name + "/"), (RootName.Replace("/", "") + targetPath + nameValue + "/"), data[x.index].IsFile, isCutRequest);
+                                await MoveDirectoryAsync(SanitizePath(path, x.name, true), SanitizePath(targetPath, nameValue, true), data[x.index].IsFile, isCutRequest);
                         }
                     }
                 }
@@ -632,9 +675,9 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 int i = names.Length;
                 string location = "";
                 if (names.Length > 0 && names[0].Contains("/"))
-                    ListingObjectsAsync("/", RootName + names[0], false).Wait();
+                    ListingObjectsAsync("/", SanitizePath("/" + names[0], null, false), false).Wait();
                 else
-                    ListingObjectsAsync("/", RootName.Replace("/", "") + (names.Length < 1 ? path.Substring(0, path.Length - 1) : path + data[0].Name), false).Wait();
+                    ListingObjectsAsync("/", SanitizePath((names.Length < 1) ? path : (path + data[0].Name), null, false), false).Wait();
                 if (data.Length == 1)
                 {
                     if (names.Length == 0 || data[i - 1].Type == "Folder")
@@ -648,7 +691,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 string previousLocation = "";
                 foreach (string name in names)
                 {
-                    ListingObjectsAsync("/", RootName.Replace("/", "") + path + name + ((data[i - 1].Type == "Folder") ? "/" : ""), false).Wait();
+                    ListingObjectsAsync("/", SanitizePath(path, name, data[i - 1].Type == "Folder"), false).Wait();
                     i--;
                     string exactName = name.IndexOf("/") > 0 ? name.Substring(name.LastIndexOf("/")) : name;
                     int indexValue = exactName == name ? response.Prefix.LastIndexOf(exactName) - 1 : response.Prefix.LastIndexOf(exactName);
@@ -664,15 +707,15 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         location = previousLocation = response.Prefix.Substring(0, indexValue);
                     }
                     foreach (S3Object key in response.S3Objects) { sizeValue = sizeValue + key.Size; }
-                    if (response.CommonPrefixes.Count > 0) this.getChildObjects(response.CommonPrefixes, true, "");
+                    if (response.CommonPrefixes.Count > 0) this.GetChildObjects(response.CommonPrefixes, true, "");
                 }
-                if (names.Length < 1) this.getChildObjects(response.CommonPrefixes, true, "");
+                if (names.Length < 1) this.GetChildObjects(response.CommonPrefixes, true, "");
                 FileDetails detailFiles = new FileDetails();
                 detailFiles = new FileDetails
                 {
-                    Name = data.Length == 1 ? (String.IsNullOrEmpty(data[0].Name) ? path.Split("/")[path.Split("/").Length - 2] : data[0].Name) : string.Join(", ", data.Select(x => x.Name).ToArray()),
+                    Name = data.Length == 1 ? (string.IsNullOrEmpty(data[0].Name) ? path.Split("/")[path.Split("/").Length - 2] : data[0].Name) : string.Join(", ", data.Select(x => x.Name).ToArray()),
                     IsFile = data[0].IsFile,
-                    Size = byteConversion(sizeValue).ToString(),
+                    Size = ByteConversion(sizeValue).ToString(),
                     Modified = data.Length == 1 && data[0].IsFile ? data[0].DateModified : DateTime.Now,
                     Created = data.Length == 1 && data[0].IsFile ? data[0].DateCreated : DateTime.Now,
                     MultipleFiles = data.Length == 1 ? false : true,
@@ -681,14 +724,14 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 ListObjectsResponse res = response;
                 getDetailResponse.Details = detailFiles;
             }
-            catch (Exception ex) { throw ex; }
+            catch (Exception) { throw; }
             return getDetailResponse;
         }
 
         public bool checkFileExist(string path, string name)
         {
             GetBucketList();
-            ListingObjectsAsync("/", RootName.Replace("/", "") + path, false).Wait();
+            ListingObjectsAsync("/", SanitizePath(path, null, true), false).Wait();
             bool checkExist = false;
             if (response.CommonPrefixes.Count > 0)
             {
@@ -701,7 +744,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             {
                 foreach (S3Object s3Object in response.S3Objects)
                 {
-                    if (s3Object.Key.ToLower() == (RootName.Replace("/", "") + path + name).ToLower()) { checkExist = true; break; }
+                    if (s3Object.Key.ToLower() == (SanitizePath(path, name, false)).ToLower()) { checkExist = true; break; }
                 }
             }
             return checkExist;
@@ -731,7 +774,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     }
                     GetBucketList();
                     FileManagerDirectoryContent CreateData = new FileManagerDirectoryContent();
-                    string key = string.Format(@"{0}/", RootName.Replace("/", "") + path + name);
+                    string key = SanitizePath(path, name, true);
                     PutObjectRequest request = new PutObjectRequest() { Key = key, BucketName = bucketName };
                     request.InputStream = new MemoryStream();
                     client.PutObjectAsync(request);
@@ -759,23 +802,23 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             try
             {
                 GetBucketList();
-                if (path == "/") ListingObjectsAsync("/", RootName, false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+                if (path == "/") ListingObjectsAsync("/", RootName, false).Wait(); else ListingObjectsAsync("/", SanitizePath(path, null, true), false).Wait();
                 List<FileManagerDirectoryContent> files = new List<FileManagerDirectoryContent>();
                 List<FileManagerDirectoryContent> filesS3 = new List<FileManagerDirectoryContent>();
-                char[] j = new Char[] { '*' };
+                char[] j = new char[] { '*' };
                 if (response.CommonPrefixes.Count > 0)
-                    files = response.CommonPrefixes.Where(x => x.Split("/")[x.Split("/").Length - 2].ToLower().Contains(searchString.TrimStart(j).TrimEnd(j).ToLower())).Select(x => CreateDirectoryContentInstance(x.Split("/")[x.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, this.checkChild(x), x.Substring(0, x.Length - x.Split("/")[x.Split("/").Length - 2].Length - 1).Substring(RootName.Length - 1))).ToList();
+                    files = response.CommonPrefixes.Where(x => x.Split("/")[x.Split("/").Length - 2].ToLower().Contains(searchString.TrimStart(j).TrimEnd(j).ToLower())).Select(x => CreateDirectoryContentInstance(x.Split("/")[x.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, this.CheckChild(x), x.Substring(0, x.Length - x.Split("/")[x.Split("/").Length - 2].Length - 1).Substring(RootName.Length - 1))).ToList();
                 if (response.S3Objects.Count > 1)
                 { // Ensure HasChild property
                     filesS3 = response.S3Objects.Where(x => (x.Key != RootName && x.Key.Split("/")[x.Key.Split("/").Length - 1].ToLower().Contains(searchString.TrimStart(j).TrimEnd(j).ToLower()))).Select(y =>
                     CreateDirectoryContentInstance(y.Key.Split("/").Last(), true, Path.GetExtension(y.Key.ToString()), y.Size, y.LastModified, y.LastModified, false, y.Key.Substring(0, y.Key.Length - y.Key.Split("/")[y.Key.Split("/").Length - 1].Length).Substring(RootName.Length - 1))).ToList();
                 }
-                if (response.CommonPrefixes.Count > 0) getChildObjects(response.CommonPrefixes, false, searchString);
+                if (response.CommonPrefixes.Count > 0) GetChildObjects(response.CommonPrefixes, false, searchString);
                 if (filesS3.Count != 0) files = files.Union(filesS3).ToList();
                 if (s3ObjectFiles.Count != 0) files = files.Union(s3ObjectFiles).ToList();
                 searchResponse.Files = files;
             }
-            catch (Exception ex) { throw ex; }
+            catch (Exception) { throw; }
             searchResponse.CWD = data[0];
             return searchResponse;
         }
@@ -802,7 +845,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             }
             else
             {
-                await MoveDirectoryAsync((RootName.Replace("/", "") + data[0].FilterPath + name + "/"), (RootName.Replace("/", "") + data[0].FilterPath + newName + "/"), data[0].IsFile, true);
+                await MoveDirectoryAsync(SanitizePath(data[0].FilterPath, name, true), SanitizePath(data[0].FilterPath, newName, true), data[0].IsFile, true);
                 try
                 {
                     if (PathPermission != null && (!PathPermission.Read || !PathPermission.Write))
@@ -812,18 +855,18 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     }
                     GetBucketList();
                     FileManagerResponse readResponse = new FileManagerResponse();
-                    if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+                    if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", SanitizePath(path, null, true), false).Wait();
                     if (path == "/")
                         cwd = response.S3Objects.Where(x => x.Key == RootName).Select(y => CreateDirectoryContentInstance(y.Key.ToString().Replace("/", ""), true, "folder", y.Size, y.LastModified, y.LastModified, false, data[0].FilterPath)).ToArray()[0];
                     else if (response.CommonPrefixes.Count > 0)
                         cwd = CreateDirectoryContentInstance(path.Split("/")[path.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, (response.CommonPrefixes.Count > 0) ? true : false, "");
                     GetBucketList();
-                    if (data[0].FilterPath == "/") ListingObjectsAsync("/", RootName, false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + data[0].FilterPath, false).Wait();
+                    if (data[0].FilterPath == "/") ListingObjectsAsync("/", RootName, false).Wait(); else ListingObjectsAsync("/", SanitizePath(data[0].FilterPath, null, true), false).Wait();
                     if (response.CommonPrefixes.Count > 1)
                     {
                         foreach (string commonPrefix in response.CommonPrefixes)
                         {
-                            if (commonPrefix == this.RootName.Replace("/", "") + path + newName + "/")
+                            if (commonPrefix == SanitizePath(path, newName, true))
                                 files.Add(CreateDirectoryContentInstance(commonPrefix.Split("/")[commonPrefix.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, false, data[0].FilterPath));
                         }
                     }
@@ -831,7 +874,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     {
                         foreach (S3Object S3Object in response.S3Objects)
                         {
-                            if (S3Object.Key == this.RootName.Replace("/", "") + data[0].FilterPath + (showFileExtension ? newName : (newName + data[0].Type)))
+                            if (S3Object.Key == SanitizePath(data[0].FilterPath , (showFileExtension ? newName : (newName + data[0].Type)), false))
                                 files.Add(CreateDirectoryContentInstance(S3Object.Key.Split("/").Last(), true, Path.GetExtension(S3Object.Key), S3Object.Size, S3Object.LastModified, S3Object.LastModified, false, data[0].FilterPath));
                         }
                     }
@@ -875,11 +918,11 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 {
                     string[] folders = file.FileName.Split('/');
                     string name = folders[folders.Length - 1];
-                    string fullName = Path.Combine(Path.GetTempPath(), name);
+                    string fullName = SanitizeAndValidatePath(Path.Combine(Path.GetTempPath(), name));
                     fullName = fullName.Replace("../", "");
                     if (uploadFiles != null)
                     {
-                        bool isValidChunkUpload = file.ContentType == "application/octet-stream";
+                        bool isValidChunkUpload = file.ContentType == "application/octet-stream" && totalChunk > 0;
                         if (action == "save")
                         {
                             bool isExist = checkFileExist(path, name);
@@ -891,7 +934,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                             {
                                 if (isValidChunkUpload)
                                 {
-                                    await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, RootName.Replace("/", "") + path + fileName);
+                                    await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, SanitizePath(path, fileName, false));
                                 }
                                 else
                                 {
@@ -921,7 +964,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
 
                             if (isValidChunkUpload)
                             {
-                                await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, RootName.Replace("/", "") + path + fileName);
+                                await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, SanitizePath(path, fileName, false));
                             }
                             else
                             {
@@ -948,7 +991,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                             GetBucketList();
                             if (isValidChunkUpload)
                             {
-                                await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, RootName.Replace("/", "") + path + newName);
+                                await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, SanitizePath(path, newName, false));
                             }
                             else
                             {
@@ -957,9 +1000,9 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         }
                         else if (action == "remove")
                         {
-                            if (System.IO.File.Exists(fullName))
+                            if (File.Exists(fullName))
                             {
-                                System.IO.File.Delete(fullName);
+                                File.Delete(fullName);
                             }
                             else
                             {
@@ -1159,7 +1202,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
         {
             using (var stream = file.OpenReadStream())
             {
-                await fileTransferUtility.UploadAsync(stream, bucketName, RootName.Replace("/", "") + path + fileName);
+                await fileTransferUtility.UploadAsync(stream, bucketName, SanitizePath(path, fileName, false));
             }
         }
 
@@ -1224,13 +1267,13 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     return null;
                 }
                 GetBucketList();
-                ListingObjectsAsync("/", RootName.Replace("/", "") + path, false).Wait();
+                ListingObjectsAsync("/", SanitizePath(path, null, false), false).Wait();
                 string fileName = path.ToString().Split("/").Last();
                 fileName = fileName.Replace("../", "");
-                Stream stream = fileTransferUtility.OpenStream(bucketName, RootName.Replace("/", "") + path);
+                Stream stream = fileTransferUtility.OpenStream(bucketName, SanitizePath(path, null, false));
                 return new FileStreamResult(stream, "APPLICATION/octet-stream");
             }
-            catch (Exception ex) { throw ex; }
+            catch (Exception) { throw; }
         }
 
         // Download file(s) or folder(s)
@@ -1247,7 +1290,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             if (names.Length == 1)
             {
                 GetBucketList();
-                await ListingObjectsAsync("/", RootName.Replace("/", "") + path + names[0], false);
+                await ListingObjectsAsync("/", SanitizePath(path, names[0], false), false);
             }
 
             if (names.Length == 1 && response.CommonPrefixes.Count == 0)
@@ -1261,18 +1304,18 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     }
 
                     GetBucketList();
-                    await ListingObjectsAsync("/", RootName.Replace("/", "") + path, false);
+                    await ListingObjectsAsync("/", SanitizePath(path, null, true), false);
 
-                    Stream stream = await fileTransferUtility.OpenStreamAsync(bucketName, RootName.Replace("/", "") + path + names[0]);
+                    Stream stream = await fileTransferUtility.OpenStreamAsync(bucketName, SanitizePath(path, names[0], false));
 
                     fileStreamResult = new FileStreamResult(stream, "APPLICATION/octet-stream");
                     fileStreamResult.FileDownloadName = names[0].Contains("/") ? names[0].Split("/").Last() : names[0];
 
                     return fileStreamResult;
                 }
-                catch (AmazonS3Exception amazonS3Exception)
+                catch (AmazonS3Exception)
                 {
-                    throw amazonS3Exception;
+                    throw;
                 }
             }
             else
@@ -1291,8 +1334,8 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                                 throw new UnauthorizedAccessException("'" + folderName + "' is not accessible. Access is denied.");
                             }
 
-                            var initialResponse = await GetRecursiveResponse("/", RootName.Replace("/", "") + path + folderName, false);
-                            await DownloadSubdirectories(archive, folderName, path + folderName, RootName.Replace("/", "") + path + folderName, initialResponse);
+                            var initialResponse = await GetRecursiveResponse("/", SanitizePath(path, folderName, true), false);
+                            await DownloadSubdirectories(archive, folderName, path + folderName, SanitizePath(path, folderName, true), initialResponse);
                         }
                     }
 
@@ -1303,9 +1346,9 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
 
                     return fileStreamResult;
                 }
-                catch (AmazonS3Exception amazonS3Exception)
+                catch (AmazonS3Exception)
                 {
-                    throw amazonS3Exception;
+                    throw;
                 }
             }
         }
@@ -1333,18 +1376,18 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             }
         }
 
-        public static async Task<ListObjectsResponse> GetRecursiveResponse(string delimiter, string prefix, bool childCheck)
+        private static async Task<ListObjectsResponse> GetRecursiveResponse(string delimiter, string prefix, bool childCheck)
         {
             try
             {
                 ListObjectsRequest request = new ListObjectsRequest { BucketName = bucketName, Delimiter = delimiter, Prefix = prefix };
                 return await client.ListObjectsAsync(request);
             }
-            catch (AmazonS3Exception amazonS3Exception) { throw amazonS3Exception; }
+            catch (AmazonS3Exception) { throw; }
         }
 
         // Deletes a Directory
-        public async Task DeleteDirectory(string path, string[] names)
+        private async Task DeleteDirectory(string path, string[] names)
         {
             try
             {
@@ -1352,23 +1395,24 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 DeleteObjectsRequest deleteObjectsRequest = new DeleteObjectsRequest() { BucketName = bucketName };
                 foreach (string name in names)
                 {
-                    ListObjectsRequest listObjectsRequest = new ListObjectsRequest { BucketName = bucketName, Prefix = RootName.Replace("/", "") + path + name + (String.IsNullOrEmpty(Path.GetExtension(name)) ? "/" : ""), Delimiter = String.IsNullOrEmpty(Path.GetExtension(name)) ? null : "/" };
+                    bool isFolder = string.IsNullOrEmpty(Path.GetExtension(name));
+                    ListObjectsRequest listObjectsRequest = new ListObjectsRequest { BucketName = bucketName, Prefix = SanitizePath(path, name, isFolder), Delimiter = String.IsNullOrEmpty(Path.GetExtension(name)) ? null : "/" };
                     ListObjectsResponse listObjectsResponse = await client.ListObjectsAsync(listObjectsRequest);
                     foreach (S3Object s3Object in listObjectsResponse.S3Objects) { deleteObjectsRequest.AddKey(s3Object.Key); }
                 }
                 await client.DeleteObjectsAsync(deleteObjectsRequest);
-                ListingObjectsAsync("/", RootName.Replace("/", "") + path + names[0], false).Wait();
+                ListingObjectsAsync("/", SanitizePath(path, names[0], false), false).Wait();
                 foreach (string name in names)
                 {
-                    string tempfile = Path.Combine(Path.GetTempPath(), name);
-                    if (System.IO.File.Exists(tempfile)) System.IO.File.Delete(tempfile); else if (Directory.Exists(tempfile)) Directory.Delete(tempfile, true);
+                    string safePath = SanitizeAndValidatePath(Path.Combine(Path.GetTempPath(), name));
+                    if (File.Exists(safePath)) File.Delete(safePath); else if (Directory.Exists(safePath)) Directory.Delete(safePath, true);
                 }
             }
-            catch (AmazonS3Exception amazonS3Exception) { throw amazonS3Exception; }
+            catch (AmazonS3Exception) { throw; }
         }
 
         //Find all keys with a prefex of sourceKey, and rename them with destinationKey for prefix
-        public async Task MoveDirectoryAsync(string sourceKey, string destinationKey, bool isFile, bool deleteS3Objects)
+        private async Task MoveDirectoryAsync(string sourceKey, string destinationKey, bool isFile, bool deleteS3Objects)
         {
             try
             {
@@ -1382,7 +1426,10 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                         string newKey = s3Object.Key.Replace(!isFile ? sourceKey : sourceKey.Substring(0, sourceKey.Length - 1), !isFile ? destinationKey : destinationKey.Substring(0, destinationKey.Length - 1));
                         CopyObjectRequest copyObjectRequest = new CopyObjectRequest() { SourceBucket = bucketName, DestinationBucket = bucketName, SourceKey = s3Object.Key, DestinationKey = newKey };
                         CopyObjectResponse copyObectResponse = await client.CopyObjectAsync(copyObjectRequest);
-                        if (deleteS3Objects) deleteObjectsRequest.AddKey(s3Object.Key);
+                        if (deleteObjectsRequest?.Objects != null && deleteObjectsRequest.Objects.Count > 0)
+                        {
+                            await client.DeleteObjectsAsync(deleteObjectsRequest);
+                        }
                     }
                     if (listObjectsResponse.IsTruncated) listObjectsRequest.Marker = listObjectsResponse.NextMarker; else listObjectsRequest = null;
                 } while (listObjectsRequest != null);
@@ -1394,7 +1441,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
         }
 
         // Gets the child  file(s) or directories details within a directory & Calculates the folder size value
-        private void getChildObjects(List<string> commonPrefixes, bool isDetailsRequest, string searchString)
+        private void GetChildObjects(List<string> commonPrefixes, bool isDetailsRequest, string searchString)
         {
             try
             {
@@ -1415,17 +1462,17 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     if (response.CommonPrefixes.Count > 0)
                     {
                         List<FileManagerDirectoryContent> innerFiles = response.CommonPrefixes.Where(x => x.Split("/")[x.Split("/").Length - 2].ToLower().Contains(searchString.TrimStart(j).TrimEnd(j).ToLower())).Select(x =>
-                        CreateDirectoryContentInstance(x.Split("/")[x.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, this.checkChild(x), x.Substring(0, x.Length - x.Split("/")[x.Split("/").Length - 2].Length - 1).Substring(RootName.Length - 1))).ToList();
+                        CreateDirectoryContentInstance(x.Split("/")[x.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, this.CheckChild(x), x.Substring(0, x.Length - x.Split("/")[x.Split("/").Length - 2].Length - 1).Substring(RootName.Length - 1))).ToList();
                         if (innerFiles.Count > 0) s3ObjectFiles = s3ObjectFiles != null ? s3ObjectFiles.Union(innerFiles).ToList() : innerFiles;
-                        this.getChildObjects(response.CommonPrefixes, isDetailsRequest, searchString);
+                        this.GetChildObjects(response.CommonPrefixes, isDetailsRequest, searchString);
                     }
                 }
             }
-            catch (Exception ex) { throw ex; }
+            catch (Exception) { throw; }
         }
 
         // Converts the bytes to definite size values
-        public String byteConversion(long fileSize)
+        private String ByteConversion(long fileSize)
         {
             try
             {
@@ -1434,10 +1481,10 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 int loc = Convert.ToInt32(Math.Floor(Math.Log(Math.Abs(fileSize), 1024)));
                 return (Math.Sign(fileSize) * (Math.Round(Math.Abs(fileSize) / Math.Pow(1024, loc), 1))).ToString() + " " + index[loc];
             }
-            catch (AmazonS3Exception amazonS3Exception) { throw amazonS3Exception; }
+            catch (AmazonS3Exception) { throw; }
         }
 
-        public string getFilterPath(string fullPath, string path)
+        private string GetFilterPath(string fullPath, string path)
         {
             string name = fullPath.ToString().Replace(RootName.Replace("/", "") + path, "").Replace("/", "");
             int nameIndex = fullPath.LastIndexOf(name);
@@ -1447,23 +1494,25 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             return fullPath;
         }
 
-        public bool checkChild(string path)
+        private bool CheckChild(string path)
         {
-            try { ListingObjectsAsync("/", path, true).Wait(); } catch (AmazonS3Exception amazonS3Exception) { throw amazonS3Exception; }
+            try { ListingObjectsAsync("/", path, true).Wait(); } catch (AmazonS3Exception) { throw; }
             return childResponse.CommonPrefixes.Count > 0 ? true : false;
         }
 
-        public static async Task ListingObjectsAsync(string delimiter, string prefix, bool childCheck)
+        private static Task ListingObjectsAsync(string delimiter, string prefix, bool childCheck)
         {
             try
             {
                 ListObjectsRequest request = new ListObjectsRequest { BucketName = bucketName, Delimiter = delimiter, Prefix = prefix };
+                var result = client.ListObjectsAsync(request).GetAwaiter().GetResult();
                 if (childCheck)
-                    childResponse = await client.ListObjectsAsync(request);
+                    childResponse = result;
                 else
-                    response = await client.ListObjectsAsync(request);
+                    response = result;
+                return Task.CompletedTask;
             }
-            catch (AmazonS3Exception amazonS3Exception) { throw amazonS3Exception; }
+            catch (AmazonS3Exception) { throw; }
         }
         public string ToCamelCase(FileManagerResponse userData)
         {
@@ -1585,6 +1634,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             folderPermission.Read = HasPermission(folderRule.Read);
             folderPermission.Upload = HasPermission(folderRule.Upload);
             folderPermission.Message = string.IsNullOrEmpty(folderRule.Message) ? string.Empty : folderRule.Message;
+            folderPermission.UploadContentFilter = folderRule.UploadContentFilter;
             return folderPermission;
         }
         protected virtual AccessPermission UpdateFileRules(AccessPermission filePermission, AccessRule fileRule)
@@ -1597,5 +1647,28 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             return filePermission;
         }
 
+        private string SanitizeAndValidatePath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                throw new ArgumentException("Path cannot be null or empty.");
+            }
+            string decodedPath;
+            do
+            {
+                decodedPath = path;
+                path = Uri.UnescapeDataString(decodedPath);
+            } while (decodedPath != path);
+            string fullPath = Path.GetFullPath(path);
+
+            // Ensure the path is within the allowed directory
+            string allowedDirectory = Path.GetFullPath(Path.GetTempPath());
+            if (!fullPath.StartsWith(allowedDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new UnauthorizedAccessException("Access to the path is not allowed.");
+            }
+
+            return fullPath;
+        }
     }
 }

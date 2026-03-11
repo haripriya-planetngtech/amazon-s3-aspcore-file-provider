@@ -66,9 +66,10 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
             return Ok(this.operation.GeneratePreSignedUrl($"{this.operation.rootFolder}{docPath}", 60));
         }
 
-        [Route("AmazonS3FileOperations")]
+        [HttpPost("AmazonS3FileOperations")]
         public object AmazonS3FileOperations([FromBody] FileManagerDirectoryContent args)
         {
+            this.operation.SetRules(GetRules());
             if (args.Action == "delete" || args.Action == "rename")
             {
                 if ((args.TargetPath == null) && (args.Path == ""))
@@ -114,7 +115,7 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
         }
 
         // uploads the file(s) into a specified path
-        [Route("AmazonS3Upload")]
+        [HttpPost("AmazonS3Upload")]
         public async Task<IActionResult> AmazonS3Upload(string path, IList<IFormFile> uploadFiles, string action, string data)
         {
             FileManagerResponse uploadResponse;
@@ -224,7 +225,7 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
 
 
         // downloads the selected file(s) and folder(s)
-        [Route("AmazonS3Download")]
+        [HttpPost("AmazonS3Download")]
         public IActionResult AmazonS3Download(string downloadInput)
         {
             var options = new JsonSerializerOptions
@@ -236,12 +237,25 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
         }
 
         // gets the image(s) from the given path
-        [Route("AmazonS3GetImage")]
+        [HttpGet("AmazonS3GetImage")]
         public IActionResult AmazonS3GetImage(FileManagerDirectoryContent args)
         {
             return operation.GetImage(args.Path, args.Id, false, null, args.Data);
         }
-    }
 
+        public AccessDetails GetRules()
+        {
+            AccessDetails accessDetails = new AccessDetails();
+            List<AccessRule> Rules = new List<AccessRule> {
+                // Deny writing for particular file
+                new AccessRule { Path = "Pictures/Employees/Adam.png", Role = "Document Manager", Read = Permission.Allow, Write = Permission.Deny, Copy = Permission.Deny, Download = Permission.Deny, IsFile = true },
+                // Deny based on the type
+                new AccessRule { Path = "Music/", Role = "Document Manager", Write = Permission.Deny, WriteContents = Permission.Deny, Upload = Permission.Allow, UploadContentFilter = UploadContentFilter.FoldersOnly, IsFile = false },
+            };
+            accessDetails.AccessRules = Rules;
+            accessDetails.Role = "Document Manager";
+            return accessDetails;
+        }
+    }
 
 }
