@@ -1,32 +1,71 @@
-﻿using Syncfusion.EJ2.FileManager.AmazonS3FileProvider;
+﻿using Amazon;
+using BitMiracle.LibTiff.Classic;
 using Microsoft.AspNetCore.Cors;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
+using Newtonsoft.Json;
+// using Syncfusion.EJ2.SpellChecker;
+// using EJ2APIServices;
+using SkiaSharp;
+using Syncfusion.DocIO;
+// using Syncfusion.EJ2.DocumentEditor;
+using Syncfusion.DocIO.DLS;
+using Syncfusion.EJ2.FileManager.AmazonS3FileProvider;
+using Syncfusion.EJ2.FileManager.Base;
 using System;
 using System.Collections.Generic;
-using Syncfusion.EJ2.FileManager.Base;
-using Amazon;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
+using WDocument = Syncfusion.DocIO.DLS.WordDocument;
+using WFormatType = Syncfusion.DocIO.FormatType;
 
 namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
 {
+
 
     [Route("api/[controller]")]
     [EnableCors("AllowAllOrigins")]
     public class AmazonS3ProviderController : Controller
     {
+        private readonly HttpClient _httpClient;
+        private readonly IConfiguration _configuration;
         public AmazonS3FileProvider operation;
         public string basePath;
         protected RegionEndpoint bucketRegion;
-        public AmazonS3ProviderController(IWebHostEnvironment hostingEnvironment)
+
+        public AmazonS3ProviderController(IWebHostEnvironment hostingEnvironment, IHostEnvironment env, IConfiguration configuration)
         {
+            this._configuration = configuration;
             this.basePath = hostingEnvironment.ContentRootPath;
             this.basePath = basePath.Replace("../", "");
-            this.operation = new AmazonS3FileProvider();
-            this.operation.RegisterAmazonS3("<---bucketName--->", "<---awsAccessKeyId--->", "<---awsSecretAccessKey--->", "<---region--->");
+            this.operation = new AmazonS3FileProvider(env);
+
+            var bucketName = this._configuration["DMSS3Bucket"] ?? string.Empty;
+            var accessKey = this._configuration["S3BucketAccessKey"] ?? string.Empty;
+            var secretKey = this._configuration["S3BucketSecretKey"] ?? string.Empty;
+            var region = this._configuration["S3Region"] ?? "ap-south-1";
+
+            this.operation.RegisterAmazonS3(bucketName, accessKey, secretKey, region);
         }
+
+        [Route("GeneratePreSignedUrl")]
+        public IActionResult GeneratePreSignedUrl(string docPath)
+        {
+            return Ok(this.operation.GeneratePreSignedUrl($"{this.operation.rootFolder}{docPath}", 60));
+        }
+
         [Route("AmazonS3FileOperations")]
         public object AmazonS3FileOperations([FromBody] FileManagerDirectoryContent args)
         {
@@ -48,7 +87,7 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
             {
                 case "read":
                     // reads the file(s) or folder(s) from the given path.
-                    return this.operation.ToCamelCase(this.operation.GetFiles(args.Path, false, args.Data));
+                    return this.operation.ToCamelCase(this.operation.GetFiles(args.Path, false, args.Names, args.Data));
                 case "delete":
                     // deletes the selected file(s) or folder(s) from the given path.
                     return this.operation.ToCamelCase(this.operation.Delete(args.Path, args.Names, args.Data));
@@ -76,7 +115,7 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
 
         // uploads the file(s) into a specified path
         [Route("AmazonS3Upload")]
-        public IActionResult AmazonS3Upload(string path, IList<IFormFile> uploadFiles, string action, string data)
+        public async Task<IActionResult> AmazonS3Upload(string path, IList<IFormFile> uploadFiles, string action, string data)
         {
             FileManagerResponse uploadResponse;
             FileManagerDirectoryContent[] dataObject = new FileManagerDirectoryContent[1];
@@ -84,7 +123,14 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
             {
                 PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             };
-            dataObject[0] = JsonSerializer.Deserialize<FileManagerDirectoryContent>(data, options);
+            if (!string.IsNullOrWhiteSpace(data))
+            {
+                dataObject[0] = JsonConvert.DeserializeObject<FileManagerDirectoryContent>(data);
+            }
+            else
+            {
+                dataObject[0] = new FileManagerDirectoryContent(); // Or handle default logic
+            }
             foreach (var file in uploadFiles)
             {
                 var folders = (file.FileName).Split('/');
@@ -110,9 +156,72 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
                 Response.ContentType = "application/json; charset=utf-8";
                 Response.StatusCode = Convert.ToInt32(uploadResponse.Error.Code);
                 Response.HttpContext.Features.Get<IHttpResponseFeature>().ReasonPhrase = uploadResponse.Error.Message;
+                //  return Content("");
+
             }
-            return Content("");
+
+            var uploadedFilesDetails = new List<object>();
+
+            // ✅ Fetch uploaded file details
+            foreach (var file in uploadFiles)
+            {
+                var actualFileName = Path.GetFileName(file.FileName);
+
+                var s3FilePath = $"{path}{actualFileName}"; // Full S3 Path
+
+                var fileDetails = new
+                {
+                    FileName = actualFileName,
+                    FilePath = $"{path}{actualFileName}",
+                    path = path,
+                    FileSize = file.Length,
+                    FileType = file.ContentType,
+                    Extension = Path.GetExtension(actualFileName),
+                    UploadDate = DateTime.UtcNow,
+                    UniqueHash = GenerateUniqueId(s3FilePath),
+                    IsEncrypted = false, // Set based on encryption status
+                    ParentFolder = GetParentFolder(s3FilePath), // Parent folder reference
+                    ThumbnailPath = "", // Generate if applicable
+                    LastModified = DateTime.UtcNow,
+                    Tags = "document, confidential, invoice",
+                    DownloadCount = 0,
+                };
+
+                uploadedFilesDetails.Add(fileDetails);
+
+            }
+
+            return Ok(JsonConvert.SerializeObject(uploadedFilesDetails, new JsonSerializerSettings
+            {
+                ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver()
+            }));
+
+
         }
+
+        public string GetParentFolder(string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath))
+                return null;
+
+            // Trim trailing slashes to avoid empty segments
+            filePath = filePath.TrimEnd('/');
+
+            var parts = filePath.Split('/');
+
+            // Ensure there is at least one parent folder before extracting
+            return parts.Length > 1 ? parts[^2] : null;
+        }
+
+        public static string GenerateUniqueId(string path)
+        {
+            using (var sha256 = SHA256.Create())
+            {
+                var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(path));
+                return BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
+            }
+        }
+
 
         // downloads the selected file(s) and folder(s)
         [Route("AmazonS3Download")]
@@ -122,7 +231,7 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
             {
                 PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             };
-            FileManagerDirectoryContent args = JsonSerializer.Deserialize<FileManagerDirectoryContent>(downloadInput, options);
+            FileManagerDirectoryContent args = JsonConvert.DeserializeObject<FileManagerDirectoryContent>(downloadInput);
             return operation.Download(args.Path, args.Names);
         }
 
@@ -133,5 +242,6 @@ namespace EJ2AmazonS3ASPCoreFileProvider.Controllers
             return operation.GetImage(args.Path, args.Id, false, null, args.Data);
         }
     }
+
 
 }

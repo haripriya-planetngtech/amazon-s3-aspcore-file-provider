@@ -1,29 +1,31 @@
 ﻿{
-  "iisSettings": {
-    "windowsAuthentication": false,
-    "anonymousAuthentication": true,
-    "iisExpress": {
-      "applicationUrl": "http://localhost:62869/",
-      "sslPort": 0
-    }
-  },
-  "profiles": {
-    "IIS Express": {
-      "commandName": "IISExpress",
-      "launchBrowser": true,
-      "launchUrl": "api/test",
-      "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
-      }
-    },
-    "EJ2FileManagerService": {
-      "commandName": "Project",
-      "launchBrowser": true,
-      "launchUrl": "api/test",
-      "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
-      },
-      "applicationUrl": "http://localhost:62870/"
-    }
-  }
+ "iisSettings": {
+   "windowsAuthentication": false,
+   "anonymousAuthentication": true,
+   "iisExpress": {
+     "applicationUrl": "https://localhost:62870/",
+     "sslPort": 62870
+   }
+ },
+ "profiles": {
+   "IIS Express": {
+     "commandName": "IISExpress",
+     "launchBrowser": true,
+     "launchUrl": "api/test",
+     "environmentVariables": {
+       "ASPNETCORE_ENVIRONMENT": "Development"
+     },
+     "framework": "net9.0"
+   },
+   "EJ2FileManagerService": {
+     "commandName": "Project",
+     "launchBrowser": true,
+     "launchUrl": "api/test",
+     "environmentVariables": {
+       "ASPNETCORE_ENVIRONMENT": "Development"
+     },
+     "applicationUrl": "https://localhost:62870/"
+   }
+ }
 }
+

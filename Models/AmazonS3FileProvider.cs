@@ -12,6 +12,10 @@ using Amazon.S3.Transfer;
 using Microsoft.AspNetCore.Mvc;
 using System.IO.Compression;
 using System.Text.Json;
+using Syncfusion.DocIO.DLS;
+using Syncfusion.EJ2.DocumentEditor;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 
 namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
 {
@@ -31,22 +35,80 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
         private static List<PartETag> partETags;
         private static string uploadId;
 
+        public string rootFolder = "";
+        private readonly IHostEnvironment _env;
+        public AmazonS3FileProvider(IHostEnvironment env)
+        {
+            _env = env;
+        }
+
         // Register the amazon client details
         public void RegisterAmazonS3(string name, string awsAccessKeyId, string awsSecretAccessKey, string region)
         {
             bucketName = name;
             RegionEndpoint bucketRegion = RegionEndpoint.GetBySystemName(region);
             client = new AmazonS3Client(awsAccessKeyId, awsSecretAccessKey, bucketRegion);
+
+            rootFolder = _env.IsDevelopment() ? "SandboxLibrary" : "Library";
+
             GetBucketList();
         }
 
         //Define the root directory to the file manager
+
+        public void EnsureRootFolderExists(string bucketName, string rootFolderName)
+        {
+            if (string.IsNullOrEmpty(RootName))
+            {
+                Console.WriteLine($"Creating root folder '{rootFolderName}/'...");
+                var putRequest = new PutObjectRequest
+                {
+                    BucketName = bucketName,
+                    Key = rootFolderName + "/", // S3 treats keys ending in "/" as folders
+                    ContentBody = "" // Empty object to simulate a folder
+                };
+
+                client.PutObjectAsync(putRequest).Wait(); // Make it synchronous
+                RootName = rootFolderName + "/";
+                Console.WriteLine($"Root folder '{RootName}' created successfully.");
+            }
+        }
+
+
         public void GetBucketList()
         {
-            ListingObjectsAsync("", "", false).Wait();
-            RootName = response.S3Objects.Where(x => x.Key.Split(".").Length != 2).First().Key;
-            RootName = RootName.Replace("../", "");
+            ListingObjectsAsync("", "", false).Wait(); // Fetch objects synchronously
+
+            if (response?.S3Objects == null || !response.S3Objects.Any())
+            {
+                Console.WriteLine("Bucket is empty. No root folder found.");
+                RootName = null;
+                EnsureRootFolderExists("mopdms",this.rootFolder);
+                return;
+            }
+
+            // Check if the environment-specific root folder exists
+            var expectedRootKey = this.rootFolder.TrimEnd('/') + "/";
+
+            bool folderExists = response.S3Objects.Any(x => x.Key == expectedRootKey);
+
+            if (!folderExists)
+            {
+                Console.WriteLine($"Root folder '{expectedRootKey}' not found. Creating...");
+                RootName = null;
+                EnsureRootFolderExists(bucketName, this.rootFolder);
+            }
+            else
+            {
+                Console.WriteLine($"Before assigning, expectedRootKey = {expectedRootKey}");
+                RootName = expectedRootKey;
+                Console.WriteLine($"After assigning, RootName = {RootName}");
+
+                Console.WriteLine($"Root folder found: {RootName}");
+            }
         }
+
+
         public void SetRules(AccessDetails details)
         {
             this.AccessDetails = details;
@@ -55,41 +117,141 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
         }
 
         // Reads the file(s) and folder(s)
-        public FileManagerResponse GetFiles(string path, bool showHiddenItems, params FileManagerDirectoryContent[] data)
+        public FileManagerResponse GetFiles(string path, bool showHiddenItems, string[] Names, params FileManagerDirectoryContent[] data)
         {
             FileManagerDirectoryContent cwd = new FileManagerDirectoryContent();
             List<FileManagerDirectoryContent> files = new List<FileManagerDirectoryContent>();
             List<FileManagerDirectoryContent> filesS3 = new List<FileManagerDirectoryContent>();
             FileManagerResponse readResponse = new FileManagerResponse();
+
+            // 🔹 List of restricted folders
+            List<string> restrictedFolders = new List<string> { };
+
             GetBucketList();
             try
             {
-                if (path == "/") ListingObjectsAsync("/", RootName , false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+                string folderName = path.Split('/').LastOrDefault();
+
+                // 🔹 Restrict folder access
+                if (restrictedFolders.Contains(folderName))
+                {
+                    throw new UnauthorizedAccessException($"Access denied to folder: {folderName}");
+                }
+
+                if (path == "/") 
+                    ListingObjectsAsync("/", RootName, false).Wait(); 
+                else 
+                    ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+
                 if (path == "/")
                 {
-                    FileManagerDirectoryContent[] s = response.S3Objects.Where(x => x.Key == RootName).Select(y => CreateDirectoryContentInstance(y.Key.ToString().Replace("/", ""), false, "Folder", y.Size, y.LastModified, y.LastModified, this.checkChild(y.Key), string.Empty)).ToArray();
+                    FileManagerDirectoryContent[] s = response.S3Objects
+                        .Where(x => x.Key == RootName)
+                        .Select(y => CreateDirectoryContentInstance(y.Key.ToString().Replace("/", ""), false, "Folder", y.Size, y.LastModified, y.LastModified, this.checkChild(y.Key), string.Empty))
+                        .ToArray();
+
                     if (s.Length > 0) cwd = s[0];
                 }
                 else
-                    cwd = CreateDirectoryContentInstance(path.Split("/")[path.Split("/").Length - 2], false, "Folder", 0, DateTime.Now, DateTime.Now, (response.CommonPrefixes.Count > 0) ? true : false, path.Substring(0, path.IndexOf(path.Split("/")[path.Split("/").Length - 2])));
+                {
+                    cwd = CreateDirectoryContentInstance(
+                        path.Split("/").LastOrDefault(),
+                        false, "Folder", 0, DateTime.Now, DateTime.Now,
+                        (response.CommonPrefixes.Count > 0) ? true : false,
+                        path.Substring(0, path.LastIndexOf('/'))
+                    );
+                }
             }
-            catch (Exception ex) { throw ex; }
+            catch (UnauthorizedAccessException e)
+            {
+                return new FileManagerResponse
+                {
+                    Error = new Syncfusion.EJ2.FileManager.Base.ErrorDetails { Message = e.Message, Code = "401" }
+                };
+            }
+            catch (Exception ex)
+            {
+                throw ex;
+            }
+
             try
             {
-                if (response.CommonPrefixes.Count > 0) {
-                    files = response.CommonPrefixes.Select((y, i) => CreateDirectoryContentInstance(getFileName(response.CommonPrefixes[i], path), false, "Folder", 0, DateTime.Now, DateTime.Now, this.checkChild(response.CommonPrefixes[i]), getFilePath(y))).ToList();
+                if (response.CommonPrefixes.Count > 0)
+                {
+                    files = response.CommonPrefixes
+                        .Select((y, i) => CreateDirectoryContentInstance(
+                            getFileName(response.CommonPrefixes[i], path), false, "Folder", 0, DateTime.Now, DateTime.Now,
+                            this.checkChild(response.CommonPrefixes[i]), getFilePath(y))
+                        ).ToList();
+
+                    // 🔹 Remove restricted folders from the files list
+                    files = files.Where(f => !restrictedFolders.Contains(f.Name)).ToList();
                 }
             }
             catch (Exception ex) { throw ex; }
+
             try
             {
-                if (path == "/") ListingObjectsAsync("/", RootName, false).Wait(); else ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+                if (path == "/") 
+                    ListingObjectsAsync("/", RootName, false).Wait(); 
+                else 
+                    ListingObjectsAsync("/", this.RootName.Replace("/", "") + path, false).Wait();
+
                 if (response.S3Objects.Count > 0)
-                    filesS3 = response.S3Objects.Where(x => x.Key != RootName.Replace("/", "") + path).Select(y => CreateDirectoryContentInstance(y.Key.ToString().Replace(RootName.Replace("/", "") + path, "").Replace("/", ""), true, Path.GetExtension(y.Key.ToString()), y.Size, y.LastModified, y.LastModified, this.checkChild(y.Key), getFilterPath(y.Key, path))).ToList();
+                {
+                    // var nameMap = Names
+                    //     .Select(n => n.Split(new[] { "<<>>" }, StringSplitOptions.None))
+                    //     .Where(parts => parts.Length == 2)
+                    //     .ToDictionary(parts => parts[1], parts => parts[0]);
+
+                    // filesS3 = response.S3Objects
+                    //     .Where(y => nameMap.Values.Any(val => Path.GetFileName(y.Key).Contains(val))) // ✅ Filter files containing a nameMap value
+                    //     .Select(y => new
+                    //     {
+                    //         File = y,
+                    //         MatchedValue = nameMap.Values.FirstOrDefault(val => Path.GetFileName(y.Key).Contains(val)) // ✅ Get the matching value
+                    //     })
+                    //     .GroupBy(x => x.MatchedValue) // ✅ Group by the nameMap value
+                    //     .Where(g => g.Key != null) // ✅ Remove null groups
+                    //     .Select(g =>
+                    //     {
+                    //         var latestFile = g.OrderByDescending(x => x.File.LastModified).FirstOrDefault(); // ✅ Get the latest file
+
+                    //         if (latestFile == null) return null;
+
+                    //         string displayName = g.Key; // ✅ Show the nameMap value (not the key)
+
+                    //         var file = CreateDirectoryContentInstance(
+                    //             displayName, // ✅ Use the nameMap value for display
+                    //             true, Path.GetExtension(latestFile.File.Key), latestFile.File.Size, latestFile.File.LastModified, latestFile.File.LastModified,
+                    //             this.checkChild(latestFile.File.Key), getFilterPath(latestFile.File.Key, path));
+
+                    //         file.Path = latestFile.File.Key;
+                    //         file.TargetPath = GeneratePreSignedUrl(latestFile.File.Key, 60);
+
+                    //         return file;
+                    //     })
+                    //     .Where(file => file != null) // ✅ Remove null results
+                    //     .ToList();
+
+                    filesS3 = response.S3Objects.Where(x => x.Key != RootName.Replace("/", "") + path)
+                    .Select(y => CreateDirectoryContentInstance(
+                        y.Key.ToString().Replace(RootName.Replace("/", "") + path, "").Replace("/", ""), 
+                        true, Path.GetExtension(y.Key.ToString()), y.Size, y.LastModified, y.LastModified, 
+                        this.checkChild(y.Key), getFilterPath(y.Key, path)
+                        )).ToList();
+
+
+                    // 🔹 Remove files inside restricted folders
+                    filesS3 = filesS3.Where(f => !restrictedFolders.Contains(f.Name)).ToList();
+                }
             }
             catch (Exception ex) { throw ex; }
+
             if (filesS3.Count != 0) files = files.Union(filesS3).ToList();
+
             readResponse.CWD = cwd;
+
             try
             {
                 if ((cwd.Permission != null && !cwd.Permission.Read))
@@ -101,13 +263,14 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             }
             catch (Exception e)
             {
-                ErrorDetails er = new ErrorDetails();
+                Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                 er.Message = e.Message.ToString();
                 er.Code = er.Message.Contains("is not accessible. You need permission") ? "401" : "417";
                 if ((er.Code == "401") && !string.IsNullOrEmpty(accessMessage)) { er.Message = accessMessage; }
                 readResponse.Error = er;
                 return readResponse;
             }
+
             readResponse.Files = files;
             return readResponse;
         }
@@ -136,6 +299,38 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             tempFile.Permission= GetPathPermission(filterpath + (value ? name :Path.GetFileNameWithoutExtension(name)), value);
             return tempFile;
         }
+
+        public string GeneratePreSignedUrl(string objectKey, int expiryMinutes = 60)
+        {
+            try
+            {
+                if (client == null)
+                {
+                    throw new InvalidOperationException("Amazon S3 client is not initialized. Call RegisterAmazonS3 first.");
+                }
+
+                var request = new GetPreSignedUrlRequest
+                {
+                    BucketName = bucketName,
+                    Key = objectKey,
+                    Expires = DateTime.UtcNow.AddMinutes(expiryMinutes),
+                    Verb = HttpVerb.GET // Use PUT if uploading
+                };
+
+                return client.GetPreSignedURL(request);
+            }
+            catch (AmazonS3Exception ex)
+            {
+                Console.WriteLine($"S3 Error: {ex.Message}");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"General Error: {ex.Message}");
+                throw;
+            }
+        }
+
 
 
         // Deletes file(s) or folder(s)
@@ -185,7 +380,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 return removeResponse;
             }
             catch (Exception ex) {
-                ErrorDetails er = new ErrorDetails();
+                Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                 er.Message = ex.Message.ToString();
                 er.Code = er.Message.Contains(" is not accessible.  You need permission") ? "401" : "417";
                 if ((er.Code == "401") && !string.IsNullOrEmpty(accessMessage)) { er.Message = accessMessage; }
@@ -322,7 +517,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 }
             }
             catch (Exception ex) {
-                ErrorDetails error = new ErrorDetails();
+                Syncfusion.EJ2.FileManager.Base.ErrorDetails error = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                 error.Message = ex.Message.ToString();
                 error.Code = error.Message.Contains("is not accessible. You need permission") ? "401" : "404";
                 if ((error.Code == "401") && !string.IsNullOrEmpty(accessMessage)) { error.Message = accessMessage; }
@@ -410,7 +605,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             }
             if (replacedItemNames.Length == 0 && existFiles.Count > 0)
             {
-                ErrorDetails er = new ErrorDetails();
+                Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                 er.FileExists = existFiles;
                 er.Code = "400";
                 er.Message = "File Already Exists";
@@ -519,7 +714,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             AccessPermission PathPermission = GetPathPermission(data[0].FilterPath+ data[0].Name, false);
             if (checkFileExist(path, name))
             {
-                ErrorDetails er = new ErrorDetails();
+                Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                 er.Code = "400";
                 er.Message = "A file or folder with the name " + name + " already exists.";
                 createResponse.Error = er;
@@ -546,7 +741,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     return createResponse;
                 }
                 catch (Exception ex) {
-                    ErrorDetails er = new ErrorDetails();
+                    Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                     er.Message = ex.Message.ToString();
                     er.Code = er.Message.Contains("is not accessible. You need permission") ? "401" : "417";
                     if ((er.Code == "401") && !string.IsNullOrEmpty(accessMessage)) { er.Message = accessMessage; }
@@ -599,7 +794,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             List<FileManagerDirectoryContent> files = new List<FileManagerDirectoryContent>();
             if (checkFileExist(data[0].FilterPath, newName))
             {
-                ErrorDetails er = new ErrorDetails();
+                Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                 er.Code = "400";
                 er.Message = "Cannot rename " + name + " to " + newName + ": destination already exists.";
                 renameResponse.Error = er;
@@ -644,7 +839,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                     return renameResponse;
                 }
                 catch (Exception ex) {
-                    ErrorDetails er = new ErrorDetails();
+                    Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                     er.Message = (ex.GetType().Name == "UnauthorizedAccessException") ? "'" + name + "' is not accessible. You need permission to perform the write action." : ex.Message.ToString();
                     er.Code = er.Message.Contains("is not accessible. You need permission") ? "401" : "417";
                     if ((er.Code == "401") && !string.IsNullOrEmpty(accessMessage)) { er.Message = accessMessage; }
@@ -710,6 +905,20 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                             {
                                 System.IO.File.Delete(fullName);
                             }
+
+                            // string fullFilePath = RootName.Replace("/", "") + path + fileName;
+
+                            // // ✅ Delete the existing file before replacing
+                            // bool fileExists = checkFileExist(path, fileName);
+                            // if (fileExists)
+                            // {
+                            //     await client.DeleteObjectAsync(new DeleteObjectRequest
+                            //     {
+                            //         BucketName = bucketName,
+                            //         Key = fullFilePath
+                            //     });
+                            // }
+
                             if (isValidChunkUpload)
                             {
                                 await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, RootName.Replace("/", "") + path + fileName);
@@ -754,7 +963,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                             }
                             else
                             {
-                                ErrorDetails er = new ErrorDetails();
+                                Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                                 er.Code = "404";
                                 er.Message = "File not found.";
                                 uploadResponse.Error = er;
@@ -764,7 +973,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 }
                 if (existFiles.Count != 0)
                 {
-                    ErrorDetails er = new ErrorDetails();
+                    Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                     er.FileExists = existFiles;
                     er.Code = "400";
                     er.Message = "File Already Exists";
@@ -773,7 +982,7 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 return uploadResponse;
             }
             catch (Exception ex) {
-                ErrorDetails er = new ErrorDetails();
+                Syncfusion.EJ2.FileManager.Base.ErrorDetails er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails();
                 er.Message = (ex.GetType().Name == "UnauthorizedAccessException") ? "'" + data[0].Name + "' is not accessible. You need permission to perform the upload action." : ex.Message.ToString();
                 er.Code = er.Message.Contains("is not accessible. You need permission") ? "401" : "417";
                 if ((er.Code == "401") && !string.IsNullOrEmpty(accessMessage)) { er.Message = accessMessage; }
@@ -781,6 +990,170 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 return uploadResponse;
             }
         }
+
+        // public virtual async Task<FileManagerResponse> AsyncUpload(string path, IList<IFormFile> uploadFiles, string action, FileManagerDirectoryContent[] data, int chunkIndex, int totalChunk)
+        // {
+        //     FileManagerResponse uploadResponse = new FileManagerResponse();
+        //     AccessPermission PathPermission = GetPathPermission(data[0].FilterPath + data[0].Name, false);
+        //     try
+        //     {
+        //         if (PathPermission != null && (!PathPermission.Read || !PathPermission.Upload))
+        //         {
+        //             accessMessage = PathPermission.Message;
+        //             throw new UnauthorizedAccessException("'" + data[0].Name + "' is not accessible. You need permission to perform the upload action.");
+        //         }
+
+        //         List<string> existFiles = new List<string>();
+        //         foreach (IFormFile file in uploadFiles)
+        //         {
+        //             string fileName = Path.GetFileName(file.FileName).Replace("../", "");
+        //             string[] folders = file.FileName.Split('/');
+        //             string name = folders[folders.Length - 1];
+        //             string fullName = Path.Combine(Path.GetTempPath(), name).Replace("../", "");
+
+        //             bool isValidChunkUpload = file.ContentType == "application/octet-stream";
+
+        //             if (action == "save")
+        //             {
+        //                 bool isExist = checkFileExist(path, name);
+        //                 if (isExist)
+        //                 {
+        //                     existFiles.Add(name);
+        //                 }
+        //                 else
+        //                 {
+        //                     if (isValidChunkUpload)
+        //                     {
+        //                         await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, RootName.Replace("/", "") + path + fileName);
+        //                     }
+        //                     else
+        //                     {
+        //                         await PerformDefaultUpload(file, fileName, path);
+
+        //                         // Extract if it's a ZIP
+        //                         if (Path.GetExtension(file.FileName).Equals(".zip", StringComparison.OrdinalIgnoreCase))
+        //                         {
+        //                             await ExtractZipAndUploadToS3(file, path);
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //             else if (action == "replace")
+        //             {
+        //                 if (System.IO.File.Exists(fullName))
+        //                 {
+        //                     System.IO.File.Delete(fullName);
+        //                 }
+
+        //                  // string fullFilePath = RootName.Replace("/", "") + path + fileName;
+
+        //                     // // ✅ Delete the existing file before replacing
+        //                 // bool fileExists = checkFileExist(path, fileName);
+        //                 // if (fileExists)
+        //                 // {
+        //                 //     await client.DeleteObjectAsync(new DeleteObjectRequest
+        //                 //     {
+        //                 //         BucketName = bucketName,
+        //                 //         Key = fullFilePath
+        //                 //     });
+        //                 // }
+
+        //                 if (isValidChunkUpload)
+        //                 {
+        //                     await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, RootName.Replace("/", "") + path + fileName);
+        //                 }
+        //                 else
+        //                 {
+        //                     await PerformDefaultUpload(file, fileName, path);
+
+        //                     if (Path.GetExtension(file.FileName).Equals(".zip", StringComparison.OrdinalIgnoreCase))
+        //                     {
+        //                         await ExtractZipAndUploadToS3(file, path);
+        //                     }
+        //                 }
+        //             }
+        //             else if (action == "keepboth")
+        //             {
+        //                 string newName = fullName;
+        //                 string newFileName = file.FileName;
+        //                 int index = fullName.LastIndexOf(".");
+        //                 int indexValue = newFileName.LastIndexOf(".");
+
+        //                 if (index >= 0)
+        //                 {
+        //                     newName = fullName.Substring(0, index);
+        //                     newFileName = newFileName.Substring(0, indexValue);
+        //                 }
+
+        //                 int fileCount = 0;
+        //                 while (checkFileExist(path, newFileName + (fileCount > 0 ? "(" + fileCount.ToString() + ")" + Path.GetExtension(name) : Path.GetExtension(name))))
+        //                 {
+        //                     fileCount++;
+        //                 }
+
+        //                 newName = newFileName + (fileCount > 0 ? "(" + fileCount.ToString() + ")" : "") + Path.GetExtension(name);
+
+        //                 if (isValidChunkUpload)
+        //                 {
+        //                     await PerformChunkedUpload(file, bucketName, chunkIndex, totalChunk, RootName.Replace("/", "") + path + newName);
+        //                 }
+        //                 else
+        //                 {
+        //                     await PerformDefaultUpload(file, newName, path);
+
+        //                     if (Path.GetExtension(file.FileName).Equals(".zip", StringComparison.OrdinalIgnoreCase))
+        //                     {
+        //                         await ExtractZipAndUploadToS3(file, path);
+        //                     }
+        //                 }
+        //             }
+        //             else if (action == "remove")
+        //             {
+        //                 if (System.IO.File.Exists(fullName))
+        //                 {
+        //                     System.IO.File.Delete(fullName);
+        //                 }
+        //                 else
+        //                 {
+        //                     uploadResponse.Error = new Syncfusion.EJ2.FileManager.Base.ErrorDetails
+        //                     {
+        //                         Code = "404",
+        //                         Message = "File not found."
+        //                     };
+        //                 }
+        //             }
+        //         }
+
+        //         if (existFiles.Count != 0)
+        //         {
+        //             uploadResponse.Error = new Syncfusion.EJ2.FileManager.Base.ErrorDetails
+        //             {
+        //                 FileExists = existFiles,
+        //                 Code = "400",
+        //                 Message = "File Already Exists"
+        //             };
+        //         }
+
+        //         return uploadResponse;
+        //     }
+        //     catch (Exception ex)
+        //     {
+        //         var er = new Syncfusion.EJ2.FileManager.Base.ErrorDetails
+        //         {
+        //             Message = (ex is UnauthorizedAccessException) ? $"'{data[0].Name}' is not accessible. You need permission to perform the upload action." : ex.Message,
+        //             Code = (ex is UnauthorizedAccessException) ? "401" : "417"
+        //         };
+
+        //         if (er.Code == "401" && !string.IsNullOrEmpty(accessMessage))
+        //         {
+        //             er.Message = accessMessage;
+        //         }
+
+        //         uploadResponse.Error = er;
+        //         return uploadResponse;
+        //     }
+        // }
+
 
         private async Task PerformDefaultUpload(IFormFile file, string fileName, string path)
         {
@@ -1015,7 +1388,9 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
                 } while (listObjectsRequest != null);
                 await client.DeleteObjectsAsync(deleteObjectsRequest);
             }
-            catch (AmazonS3Exception amazonS3Exception) { throw amazonS3Exception; }
+            catch (AmazonS3Exception amazonS3Exception) { 
+                Console.WriteLine(amazonS3Exception);
+                throw amazonS3Exception; }
         }
 
         // Gets the child  file(s) or directories details within a directory & Calculates the folder size value
@@ -1221,5 +1596,6 @@ namespace Syncfusion.EJ2.FileManager.AmazonS3FileProvider
             filePermission.Message = string.IsNullOrEmpty(fileRule.Message) ? string.Empty : fileRule.Message;
             return filePermission;
         }
+
     }
 }
