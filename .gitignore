@@ -1,0 +1,13 @@
+.vs/
+.vscode/
+bin/
+obj/
+published/
+*.zip
+*.user
+*.suo
+*.db
+
+# Local environment files
+appsettings.Local.json
+appsettings.Development.json
